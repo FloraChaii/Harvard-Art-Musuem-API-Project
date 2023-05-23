@@ -1,0 +1,244 @@
+---
+title: "Harvard API"
+output: html_document
+date: "2023-05-22"
+---
+```{r}
+suppressMessages(library("dplyr"))
+suppressMessages(library("tidyr"))
+suppressMessages(library("ggplot2"))
+suppressMessages(library("DBI"))
+suppressMessages(library("httr"))
+suppressMessages(library("jsonlite"))
+suppressMessages(library("tidyverse"))
+suppressMessages(library("rvest"))
+
+```
+
+
+
+1. Get data of 1000 Objects 
+```{r}
+#write a function to get data of 100 objects in one page, and then loop over 10 pages.
+get_page <- function(pagenum){
+  apikey <- "35c56c75-b456-42df-9c6c-7e21601e5a3a"
+  url <- sprintf("https://api.harvardartmuseums.org/object?size=100&page=%g&apikey=%s", pagenum, apikey)
+  r <- GET(url)
+  while (r$status_code != 200){
+    message("Error occured. Retry after 10 seconds..")
+    Sys.sleep(10) 
+    r <- GET(url)
+  }
+  # Write the return into R as dataframe once no error
+  json_as_text <- content(r, "text")
+  json <- fromJSON(json_as_text)
+  df <- json$records %>% as_tibble()
+  # Return the dataframe
+  return(df)
+}
+
+for (i in 1:10) {
+  assign(paste0("page", i),
+         get_page(i))
+  message(ncol(get_page(i)))
+  Sys.sleep(6)
+}
+
+#Combine all pages into one dataframe.
+objects <- bind_rows(page1, page2, page3, page4, page5,page6,page7,page8,page9,page10)
+
+head(objects)
+
+```
+
+2. Separate the dataframe "Object" into five sub-dataframes and remove irrelevent columns.
+
+```{r}
+
+#main information of the object
+object <- objects %>% 
+  subset(select = c("objectid","title", "dated","medium","classification","department","culture","division","period", "verificationlevel", "style", "technique", "description", "url"))
+
+#how open can the object be accessed 
+publicity <- objects %>%
+  subset(select = c("objectid", "accesslevel", "lendingpermissionlevel", "imagepermissionlevel"))
+
+#previous ownership and accession history of the object  
+history <- objects %>%
+  subset(select = c("objectid", "accessionyear", "accessionmethod", "provenance"))
+  
+#information of the popularity of the object
+popularity <- objects %>%
+  subset(select = c("objectid", "dateoflastpageview", "totaluniquepageviews", "publicationcount","rank","exhibitioncount"))
+
+#author of the object. made by cleanning the nasty people column. Mutate an objectid for each people to identify it with the object for future link table
+peo <- data.frame()
+for (i in 1:1000){
+  if(is.null(objects[i,]$people[[1]])==TRUE){
+  next
+  } else {
+    p <-  mutate(objects[i,]$people[[1]], objectid = objects[i,]$objectid)
+  peo <- bind_rows(peo,p)
+  }
+}
+people <- peo[,c("objectid","role","gender","displaydate","displayname","personid")]
+
+
+#Write data base
+db2 <- dbConnect(RSQLite::SQLite(), "Harvard-art-museum.sqlite")
+dbWriteTable(db2, "object", object, overwrite = TRUE)
+dbWriteTable(db2, "publicity", publicity, overwrite = TRUE)
+dbWriteTable(db2, "ownerhistory", history, overwrite = TRUE)
+dbWriteTable(db2, "people", people, overwrite = TRUE)
+dbWriteTable(db2, "popularity", popularity, overwrite = TRUE)
+
+
+#Print out the total number of rows for each table in the database. Print out the first five rows for each table.
+dbGetQuery(db2, 'SELECT COUNT(*) AS object_nrow FROM object')
+dbGetQuery(db2, 'SELECT COUNT(*) AS publicity_nrow FROM publicity')
+dbGetQuery(db2, 'SELECT COUNT(*) AS ownerhistory_nrow FROM ownerhistory')
+dbGetQuery(db2, 'SELECT COUNT(*) AS people_nrow FROM people')
+dbGetQuery(db2, 'SELECT COUNT(*) AS popularity_nrow FROM popularity')
+dbGetQuery(db2, 'SELECT * FROM object LIMIT 5')
+dbGetQuery(db2, 'SELECT * FROM publicity LIMIT 5')
+dbGetQuery(db2, 'SELECT * FROM ownerhistory LIMIT 5')
+dbGetQuery(db2, 'SELECT * FROM people LIMIT 5')
+dbGetQuery(db2, 'SELECT * FROM popularity LIMIT 5')
+
+
+```
+
+3. All tables can be join directly on 'objectid'column. Examples shown as below.
+
+```{r}
+dbGetQuery(db2, "SELECT *  
+           FROM object JOIN publicity 
+           ON object.objectid = publicity.objectid
+           LIMIT 5")
+dbGetQuery(db2, "SELECT COUNT(*)  
+           FROM object JOIN publicity 
+           ON object.objectid = publicity.objectid")
+dbGetQuery(db2, "SELECT *  
+           FROM object JOIN ownerhistory 
+           ON object.objectid = ownerhistory.objectid
+           LIMIT 5")
+dbGetQuery(db2, "SELECT COUNT(*)  
+           FROM object JOIN ownerhistory 
+           ON object.objectid = ownerhistory.objectid")
+dbGetQuery(db2, "SELECT *  
+           FROM object JOIN popularity 
+           ON object.objectid = popularity.objectid
+           LIMIT 5")
+dbGetQuery(db2, "SELECT COUNT(*)  
+           FROM object JOIN popularity 
+           ON object.objectid = popularity.objectid")
+dbGetQuery(db2, "SELECT *  
+           FROM object JOIN people 
+           ON object.objectid = people.objectid
+           LIMIT 5")
+dbGetQuery(db2, "SELECT COUNT(*)  
+           FROM object JOIN people 
+           ON object.objectid = people.objectid")
+
+
+```
+
+4. Basic exploreation of gender in the data. Visualization using ggplot2. 
+
+1). Firstly, investigated the gender distribution in all 1000 piece of artworks. Noticed an astonishing imbalance.
+
+```{r}
+
+data1 <- dbGetQuery(db2, "SELECT gender, COUNT(*) AS count
+            FROM object JOIN people 
+            ON object.objectid = people.objectid
+            GROUP BY gender")
+t1 <- ggplot(data = data1, aes(x = gender, y = count))
+t1 +geom_col(fill = "lightblue", colour = "black") +
+  xlab("gender") +
+  ylab("counts") +
+  ggtitle("Gender distribution of artists in 1000 pieces of collection from Harvard Art Museum",
+          "There is an astonishing imbanlance in artists gender distribution.") +
+  theme_minimal()+
+  theme(strip.text = element_text(size = rel(0.3)),
+        axis.title = element_text(size = rel(0.8)),
+        axis.text = element_text(size = rel(0.8),
+                                 color = "#555555"),
+        plot.title = element_text(family="serif", 
+                                  size = rel(0.7),
+                                  color = "#555555"),
+        plot.subtitle = element_text(size = rel(0.5),
+                                     color = "#555555"))
+```
+
+
+2). I next investigated the proportional distribution of gender by division. Noticed that there was still a large imbalance. Another interesting observation was that there was a large proportion of "unknown-gender" artists in the division of Asian and Mediterranean art. This showed that the museum study at Harvard was still quite Euro-centric, lacking knowledge of the Eastern artworks.   
+```{r}
+data2 <- dbGetQuery(db2, "SELECT gender, division, CAST(COUNT(*) AS REAL)/(
+SELECT divi_data.division_count
+FROM (
+  SELECT division, COUNT(*) AS division_count 
+          FROM object 
+          GROUP BY division
+) AS divi_data 
+WHERE divi_data.division == division
+) AS ratio
+            FROM object JOIN people 
+            ON object.objectid = people.objectid
+            GROUP BY division, gender")
+t2 <- ggplot(data = data2, aes(x = division, y = ratio, fill = gender))
+t2 +geom_col(position = "fill") +
+  xlab("division") +
+  ylab("weight") +
+  ggtitle("The proportional gender distribution of artists in 1000 pieces of collection from Harvard Art Museum, by division",
+          "Still notice large imbanlance in artists gender distribution by division.") +
+  theme_minimal()+
+  theme(strip.text = element_text(size = rel(0.3)),
+        axis.title = element_text(size = rel(0.8)),
+        axis.text = element_text(size = rel(0.6),
+                                 color = "#555555"),
+        plot.title = element_text(family="serif", 
+                                  size = rel(0.7),
+                                  color = "#555555"),
+        plot.subtitle = element_text(size = rel(0.5),
+                                     color = "#555555"),
+        axis.text.x = element_text(angle = 10, 
+                                   hjust = .5, 
+                                   vjust = 1),
+        legend.key.size = unit(0.3, 'cm'), 
+        legend.title = element_text(size=rel(0.8), face = "bold"), 
+        legend.text = element_text(size=rel(0.5)), 
+        legend.justification = "top")
+
+```
+
+3). Finally, I investigated the relationship between gender and popularity, testing whether the application of modern-days technology altered the dynamic of gender in artworks. In other words, whether the popularity score for female artists' work got closer, or even higher than the male artists'. I used the key variable "rank" from popularity table as a proxy of popularity. Below was the description of "rank" on the API page:
+
+"rank is a number that is a measurement of how inactive the object is. The number is computed every time the data in the API is refreshed. A number of factors go in to generating the number including membership in the “Collection Highlight” group, total number of page views (since 2009), and date of last page view. A lower number means the object is less active. We use the rank field to sort objects on our Browse Our Collections page. We do this to get the least active objects to rise to the top of search results so more of the collection is seen and used online."
+
+The results showed that the IQR of male artists was very small, which illustrated that the popularity score of the majority of artworks of male artists concentrated at the higher end compared to other gender categories.The IQR of female artists was bigger, which illustrated that distribution of the popularity score of female artists was more dispersive. Judging from IQR, the advantage of male artists still existed. However, if we look into the median value, we would discover by surprise that the median value of male artist and female artist were similar. Inferring from this discovery, it may be induced that online viewing of artwork brought more exposure to the work of female artist.
+```{r}
+
+data3 <- dbGetQuery(db2, "SELECT popularity.objectid, people.gender, popularity.rank 
+            FROM popularity JOIN people 
+            ON popularity.objectid = people.objectid")
+t3 <- ggplot(data = data3, aes(x = gender, y = rank))
+t3 +geom_boxplot() +
+  xlab("gender") +
+  ylab("popularity") +
+  ggtitle("The relationship between gender and popularity in 1000 pieces of collection from Harvard Art Museum.",
+          "The number of 'rank' is used as a proxy value for popularity of artworks. It is a measurement of how inactive the object is.\n(source:https://github.com/harvardartmuseums/api-docs/blob/master/sections/object.md)") +
+  theme_minimal()+
+  theme(strip.text = element_text(size = rel(0.3)),
+        axis.title = element_text(size = rel(0.8)),
+        axis.text = element_text(size = rel(0.6),
+                                 color = "#555555"),
+        axis.text.y = element_blank(),
+        plot.title = element_text(family="serif", 
+                                  size = rel(0.7),
+                                  color = "#555555"),
+        plot.subtitle = element_text(size = rel(0.4),
+                                     color = "#555555"))
+
+```
+
